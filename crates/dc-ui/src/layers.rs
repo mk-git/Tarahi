@@ -151,6 +151,12 @@ struct Entry {
     /// counts mean equal sets).
     greek_sizes: Option<Arc<[f64]>>,
     greek_count: usize,
+    /// The canvas stroke floor the retained SVG was serialized with
+    /// (`dc::svg::layer_stroke_floor_in`), and its narrowest stroke:
+    /// another bucket reuses the bytes only when no stroke would
+    /// floor differently there.
+    stroke_floor: f64,
+    min_stroke: f64,
     /// RGBA bytes of the landed texture (LRU accounting, #124 item 4).
     bytes: u64,
     /// Monotonic visibility stamp — the store's LRU clock (item 4).
@@ -1018,6 +1024,8 @@ impl ShapeLayers {
                 tree_version: u64::MAX,
                 greek_sizes: None,
                 greek_count: 0,
+                stroke_floor: 0.0,
+                min_stroke: f64::INFINITY,
                 bytes: 0,
                 last_used: 0,
             });
@@ -1219,7 +1227,8 @@ impl ShapeLayers {
                         // re-serialize, no re-parse. Otherwise serialize
                         // (also when the new bucket would greek different
                         // text blocks, #124 item 2).
-                        let profile_ok = entry.greek_profile_matches(bucket_ppi);
+                        let profile_ok = entry.greek_profile_matches(bucket_ppi)
+                            && entry.stroke_profile_matches(bucket_ppi, bbox);
                         let use_tree =
                             entry.tree.is_some() && entry.tree_version == version && profile_ok;
                         if !use_tree
@@ -1238,6 +1247,9 @@ impl ShapeLayers {
                                 Some(&fields),
                             ) {
                                 Ok((sizes, svg)) => {
+                                    entry.stroke_floor =
+                                        dc::svg::layer_stroke_floor_in(bucket_ppi, bbox);
+                                    entry.min_stroke = dc::svg::min_stroke_width(&svg);
                                     entry.svg = Some(svg);
                                     entry.svg_version = version;
                                     entry.greek_count = dc::svg::greeked_count(&sizes, bucket_ppi);
@@ -1408,6 +1420,19 @@ impl Entry {
     /// item 2): the same number of blocks greeks — and since
     /// greeked-ness is monotone in size, the same SET of blocks — so
     /// the retained bytes are still exactly what this bucket renders.
+    /// Whether the retained SVG still paints this bucket's strokes:
+    /// the same canvas stroke floor, or a floor below every stroke at
+    /// both buckets (then no stroke was or would be raised and the bytes
+    /// are identical). A floored hairline otherwise stays 1 px wide
+    /// only at the zoom it was serialized for.
+    fn stroke_profile_matches(&self, bucket_ppi: f32, bbox: (f64, f64, f64, f64)) -> bool {
+        let floor = dc::svg::layer_stroke_floor_in(bucket_ppi, bbox);
+        // The SVG writes widths to 5 decimals: a stroke within that of
+        // the floor was raised to it.
+        let none_floored = self.min_stroke > self.stroke_floor + 1e-5;
+        (floor - self.stroke_floor).abs() < 1e-12 || (none_floored && floor < self.min_stroke)
+    }
+
     fn greek_profile_matches(&self, bucket_ppi: f32) -> bool {
         match &self.greek_sizes {
             // No text sizes recorded (text-free layer, or never
@@ -1583,6 +1608,8 @@ mod tests {
             tree_version: u64::MAX,
             greek_sizes: None,
             greek_count: 0,
+            stroke_floor: 0.0,
+            min_stroke: f64::INFINITY,
             bytes: 0,
             last_used: 0,
         }

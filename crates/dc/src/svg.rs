@@ -1131,6 +1131,9 @@ fn render_shape_layer_inner(
             .is_some_and(|m| hidden.contains(&(m as i64)))
     };
     let greek = greek_ppi.map(GreekCtx::new);
+    // The canvas render (a ppi is given) paints every stroke at least
+    // one device pixel wide, like Visio on screen; exports pass none.
+    let _floor = StrokeFloorGuard::set(greek_ppi, bounds);
     let mut svg = String::new();
     let (bx, by, bw, bh) = bounds;
     let _ = writeln!(
@@ -3733,7 +3736,7 @@ fn emit_text(
                             yy = y + dy * fs,
                             x2 = x + seg_w,
                             c = escape_attr(ink),
-                            w = fs * 0.06,
+                            w = floored_stroke(fs * 0.06),
                         );
                     }
                 }
@@ -6505,7 +6508,7 @@ fn emit_arrow_head(
     };
     // The group scales unit-space geometry by `unit`; open strokes
     // divide the pen back out so the ink is `weight` wide on paper.
-    let pen = weight / unit;
+    let pen = floored_stroke(weight) / unit;
     let color = escape_attr(color);
     let mut body = String::new();
     for part in parts {
@@ -6688,6 +6691,76 @@ fn rel_adjust(t: &str, x: f64, y: f64, w: f64, h: f64) -> (f64, f64) {
     }
 }
 
+thread_local! {
+    /// The narrowest stroke (inches) the current canvas layer render
+    /// paints — see [`stroke_floor_in`]. Zero outside a canvas render.
+    static STROKE_FLOOR_IN: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
+/// The narrowest stroke the canvas paints at `ppi` pixels per inch:
+/// one device pixel at the low end of `ppi`'s half-octave. Visio draws
+/// every line at least one pixel wide on screen, so hairlines stay
+/// solid when zoomed out; tiny-skia fades a sub-pixel stroke to a gray
+/// ghost instead. Quantized to half-octaves so a layer re-serializes
+/// only when the zoom moves far enough to change a floored stroke
+/// (floored lines are 1 to 1.41 px).
+pub fn stroke_floor_in(ppi: f32) -> f64 {
+    if !ppi.is_finite() || ppi <= 0.0 {
+        return 0.0;
+    }
+    let class = (2.0 * (ppi as f64).log2()).floor();
+    1.0 / 2f64.powf(class / 2.0)
+}
+
+/// The narrowest positive `stroke-width` in a rendered layer, for the
+/// canvas's tree-reuse check. Infinite when the layer strokes nothing.
+pub fn min_stroke_width(svg: &str) -> f64 {
+    svg.split("stroke-width=\"")
+        .skip(1)
+        .filter_map(|t| t.split('"').next()?.parse::<f64>().ok())
+        .filter(|w| *w > 0.0)
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// `w` raised to the current canvas floor; an explicit zero stays zero
+/// (#235: Visio paints nothing at LineWeight 0).
+fn floored_stroke(w: f64) -> f64 {
+    if w > 0.0 {
+        w.max(STROKE_FLOOR_IN.with(|f| f.get()))
+    } else {
+        w
+    }
+}
+
+/// Sets the canvas stroke floor for the rest of a layer render and
+/// clears it on drop.
+struct StrokeFloorGuard;
+
+impl StrokeFloorGuard {
+    fn set(ppi: Option<f32>, bounds: (f64, f64, f64, f64)) -> StrokeFloorGuard {
+        let floor = ppi.map_or(0.0, |p| layer_stroke_floor_in(p, bounds));
+        STROKE_FLOOR_IN.with(|f| f.set(floor));
+        StrokeFloorGuard
+    }
+}
+
+/// The stroke floor a canvas layer with `bounds` (inches) renders with
+/// at `ppi`: [`stroke_floor_in`] at the ppi the layer's texture really
+/// gets — the canvas caps a texture at 2048 px a side, so a large layer
+/// rasterizes coarser than the zoom asks for.
+pub fn layer_stroke_floor_in(ppi: f32, bounds: (f64, f64, f64, f64)) -> f64 {
+    const MAX_TEX: f64 = 2048.0;
+    let cap = (MAX_TEX / bounds.2.max(1e-9)).min(MAX_TEX / bounds.3.max(1e-9));
+    stroke_floor_in((ppi as f64).min(cap) as f32)
+}
+
+impl Drop for StrokeFloorGuard {
+    fn drop(&mut self) {
+        STROKE_FLOOR_IN.with(|f| f.set(0.0));
+    }
+}
+
+
 /// The stroke half of a style attribute (#228 split): dashed strokes
 /// carry `stroke-linecap="round"` — the cap the dash table's
 /// ink→geometry conversion assumes (#235).
@@ -6711,7 +6784,7 @@ fn stroke_attr(
         format!(
             r#"stroke="{}" stroke-width="{:.5}"{dash}{}"#,
             escape_attr(line_color),
-            line_weight,
+            floored_stroke(line_weight),
             opacity_attr("stroke-opacity", alpha)
         )
     }
